@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.agent/
+.claude/
+docs/
+models/
+*.code-workspace
+gpt.txt
+sync.bat
