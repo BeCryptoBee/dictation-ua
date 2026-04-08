@@ -8,7 +8,9 @@
 - UI — іконка в system tray, без вікна
 """
 
+import json
 import logging
+import os
 import re
 import signal
 import sys
@@ -20,6 +22,29 @@ from transcriber import Transcriber
 from hotkey import HotkeyManager, DEFAULT_HOTKEY
 from inserter import TextInserter
 from ui import TrayUI, AppState
+
+# Шлях до конфіга (поруч з run.bat, на рівень вище src/)
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+
+
+def _load_config() -> dict:
+    """Завантажити config.json, повертає дефолти якщо файл відсутній."""
+    defaults = {"hotkey": DEFAULT_HOTKEY, "model": "large-v3-turbo"}
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return {**defaults, **cfg}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return defaults
+
+
+def _save_config(cfg: dict) -> None:
+    """Зберегти конфіг у config.json."""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+    except OSError as e:
+        logging.getLogger(__name__).warning("Не вдалось зберегти конфіг: %s", e)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +59,8 @@ logger = logging.getLogger(__name__)
 MIN_NEW_AUDIO_SEC = 5.0
 # Пауза між перевірками нового аудіо (сек)
 CHECK_INTERVAL_SEC = 0.3
+# Максимальна тривалість запису (сек) — автостоп
+MAX_RECORDING_SEC = 120.0
 
 # Відомі галюцинації Whisper для української мови
 HALLUCINATION_PATTERNS = [
@@ -76,7 +103,7 @@ class DictationApp:
         self._transcriber = Transcriber(model_size=model_size)
         self._hotkey_mgr = HotkeyManager()
         self._inserter = TextInserter()
-        self._ui = TrayUI()
+        self._ui = TrayUI(hotkey=hotkey)
 
         self._is_dictating = False
         self._lock = threading.Lock()
@@ -99,6 +126,7 @@ class DictationApp:
         logger.info("=" * 50)
 
         self._ui.set_close_callback(self._on_shutdown)
+        self._ui.set_hotkey_change_callback(self._on_hotkey_change)
         self._ui.set_state(AppState.LOADING)
 
         def _sigint_handler(*_):
@@ -135,6 +163,29 @@ class DictationApp:
                 self._stop_dictation()
             else:
                 self._start_dictation()
+
+    def _on_hotkey_change(self, new_hotkey: str) -> None:
+        """Змінити хоткей на льоту і зберегти в config.json."""
+        try:
+            self._hotkey_mgr.unregister_all()
+            self._hotkey_mgr.register(new_hotkey, self._on_hotkey)
+            self._hotkey = new_hotkey
+
+            cfg = _load_config()
+            cfg["hotkey"] = new_hotkey
+            _save_config(cfg)
+            logger.info("Хоткей змінено і збережено: %s", new_hotkey)
+        except Exception as e:
+            logger.error("Не вдалось змінити хоткей: %s", e)
+            # Повернути старий
+            self._hotkey_mgr.register(self._hotkey, self._on_hotkey)
+
+    def _autostop(self) -> None:
+        """Автоматична зупинка при перевищенні ліміту запису."""
+        with self._lock:
+            if self._is_dictating:
+                logger.info("Автостоп: зупиняю диктовку")
+                self._stop_dictation()
 
     def _start_dictation(self) -> None:
         try:
@@ -202,20 +253,33 @@ class DictationApp:
     def _transcribe_loop(self) -> None:
         """
         Головний цикл: чекає MIN_NEW_AUDIO_SEC секунд, бере нове аудіо,
-        транскрибує Whisper medium, дописує в поле.
+        транскрибує Whisper, дописує в поле. Автостоп при MAX_RECORDING_SEC.
         """
         import numpy as np
+        import time as _time
 
         logger.info("Transcribe-потік запущено")
         sample_rate = 16000
         min_samples = int(MIN_NEW_AUDIO_SEC * sample_rate)
+        max_samples = int(MAX_RECORDING_SEC * sample_rate)
         accumulated = np.array([], dtype=np.float32)
+        total_samples = 0
+        start_time = _time.monotonic()
 
         while not self._transcribe_stop.is_set():
             if self._transcribe_stop.wait(timeout=CHECK_INTERVAL_SEC):
                 break
 
             if not self._is_dictating:
+                break
+
+            # Автостоп при перевищенні ліміту
+            elapsed = _time.monotonic() - start_time
+            if elapsed >= MAX_RECORDING_SEC:
+                logger.info("Автостоп: досягнуто ліміт %.0f сек", MAX_RECORDING_SEC)
+                threading.Thread(
+                    target=self._autostop, daemon=True
+                ).start()
                 break
 
             # Накопичити нове аудіо
@@ -362,11 +426,16 @@ VALID_MODELS = {
 
 
 def main():
-    model_size = "large-v3-turbo"
+    cfg = _load_config()
+
+    model_size = str(cfg.get("model", "large-v3-turbo"))
+    hotkey = str(cfg.get("hotkey", DEFAULT_HOTKEY))
+
+    # CLI аргумент перевизначає конфіг
     if len(sys.argv) > 1 and sys.argv[1] in VALID_MODELS:
         model_size = sys.argv[1]
 
-    app = DictationApp(model_size=model_size)
+    app = DictationApp(model_size=model_size, hotkey=hotkey)
     app.start()
 
 
