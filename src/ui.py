@@ -173,12 +173,17 @@ class TrayUI:
             if state["done"]:
                 return
             state["done"] = True
+            # Зняти тільки наш хук, не чіпати хоткеї диктовки
+            if state.get("hook"):
+                try:
+                    kb.unhook(state["hook"])
+                except Exception:
+                    pass
             if new_hotkey and new_hotkey != self._hotkey:
                 self._hotkey = new_hotkey
                 if self._hotkey_change_callback:
                     self._hotkey_change_callback(new_hotkey)
             try:
-                kb.unhook_all()
                 root.destroy()
             except Exception:
                 pass
@@ -216,14 +221,15 @@ class TrayUI:
             elif event.event_type == "up":
                 state["pressed"].discard(name)
 
-        kb.hook(_on_key)
+        state["hook"] = kb.hook(_on_key)
 
         def _on_close():
             state["done"] = True
-            try:
-                kb.unhook_all()
-            except Exception:
-                pass
+            if state.get("hook"):
+                try:
+                    kb.unhook(state["hook"])
+                except Exception:
+                    pass
             root.destroy()
 
         root.protocol("WM_DELETE_WINDOW", _on_close)

@@ -425,7 +425,26 @@ VALID_MODELS = {
 }
 
 
+LOCK_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".dictation.lock")
+
+
+def _check_single_instance():
+    """Перевірити що не запущено другий екземпляр."""
+    import msvcrt
+    try:
+        # Відкрити lock-файл ексклюзивно
+        lock_fd = open(LOCK_FILE, "w")
+        msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+        # Тримати файл відкритим — при завершенні процесу лок зніметься
+        return lock_fd
+    except (OSError, IOError):
+        logger.error("Диктовка вже запущена! Закрийте попередній екземпляр.")
+        sys.exit(1)
+
+
 def main():
+    lock = _check_single_instance()
+
     cfg = _load_config()
 
     model_size = str(cfg.get("model", "large-v3-turbo"))
@@ -437,6 +456,9 @@ def main():
 
     app = DictationApp(model_size=model_size, hotkey=hotkey)
     app.start()
+
+    # Зняти лок
+    lock.close()
 
 
 if __name__ == "__main__":
