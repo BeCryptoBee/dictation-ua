@@ -8,6 +8,7 @@
 - UI — іконка в system tray, без вікна
 """
 
+import faulthandler
 import json
 import logging
 import os
@@ -16,6 +17,8 @@ import signal
 import sys
 import threading
 import queue
+import winsound
+from logging.handlers import RotatingFileHandler
 
 from recorder import AudioRecorder
 from transcriber import Transcriber
@@ -23,8 +26,10 @@ from hotkey import HotkeyManager, DEFAULT_HOTKEY
 from inserter import TextInserter
 from ui import TrayUI, AppState
 
-# Шлях до конфіга (поруч з run.bat, на рівень вище src/)
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+# Корінь проєкту (на рівень вище src/) — для config.json, dictation.log, .dictation.lock
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.json")
+LOG_PATH = os.path.join(PROJECT_ROOT, "dictation.log")
 
 
 def _load_config() -> dict:
@@ -46,13 +51,65 @@ def _save_config(cfg: dict) -> None:
     except OSError as e:
         logging.getLogger(__name__).warning("Не вдалось зберегти конфіг: %s", e)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+def _setup_logging() -> None:
+    """Налаштувати логування у файл + stdout. Файл — головне, бо pythonw.exe не має консолі."""
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # Очистити дефолтні хендлери (на випадок повторного виклику)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    try:
+        file_h = RotatingFileHandler(
+            LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8",
+        )
+        file_h.setFormatter(fmt)
+        root.addHandler(file_h)
+    except OSError as e:
+        # Якщо файл недоступний — продовжуємо тільки зі stdout
+        sys.stderr.write(f"[WARN] Не вдалось відкрити лог-файл {LOG_PATH}: {e}\n")
+    # stdout доступний тільки при запуску через .bat (CMD), а не через pythonw
+    if sys.stdout is not None:
+        stream_h = logging.StreamHandler(sys.stdout)
+        stream_h.setFormatter(fmt)
+        root.addHandler(stream_h)
+
+
+_setup_logging()
 logger = logging.getLogger(__name__)
+
+# Native crash dump (SIGSEGV / abort з CUDA, cuBLAS, sounddevice, тощо).
+# При фатальному краху C-розширень faulthandler запише traceback у цей файл.
+FAULT_LOG_PATH = os.path.join(PROJECT_ROOT, "fault.log")
+try:
+    _fault_file = open(FAULT_LOG_PATH, "a", buffering=1, encoding="utf-8")
+    _fault_file.write(f"\n--- faulthandler enabled at process start ---\n")
+    _fault_file.flush()
+    faulthandler.enable(file=_fault_file, all_threads=True)
+except OSError as e:
+    logger.warning("Не вдалось активувати faulthandler: %s", e)
+
+
+def _excepthook(exc_type, exc_value, exc_tb) -> None:
+    """Перехоплювати необроблені винятки в головному потоці."""
+    logger.critical("Необроблений виняток", exc_info=(exc_type, exc_value, exc_tb))
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def _thread_excepthook(args) -> None:
+    """Перехоплювати необроблені винятки у фонових потоках (Python 3.8+)."""
+    logger.critical(
+        "Необроблений виняток у потоці %s",
+        args.thread.name if args.thread else "?",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+sys.excepthook = _excepthook
+threading.excepthook = _thread_excepthook
 
 # Мінімальна тривалість нового аудіо для транскрипції (сек)
 # 5 сек — менше розрізів слів на межах чанків
@@ -60,7 +117,26 @@ MIN_NEW_AUDIO_SEC = 5.0
 # Пауза між перевірками нового аудіо (сек)
 CHECK_INTERVAL_SEC = 0.3
 # Максимальна тривалість запису (сек) — автостоп
-MAX_RECORDING_SEC = 120.0
+MAX_RECORDING_SEC = 180.0
+
+# Windows Speech sounds — нативний звуковий набір для голосового вводу.
+_WIN_MEDIA = r"C:\Windows\Media"
+SOUND_START = os.path.join(_WIN_MEDIA, "Speech On.wav")
+SOUND_STOP = os.path.join(_WIN_MEDIA, "Speech Off.wav")
+SOUND_AUTOSTOP = os.path.join(_WIN_MEDIA, "Speech Sleep.wav")
+
+
+def _play_sound(path: str) -> None:
+    """Програти .wav-файл асинхронно. Якщо файлу немає — тихий no-op."""
+    try:
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except Exception as e:
+        logger.debug("PlaySound помилка: %s", e)
+
+
+# Прибрати багатослівний логгер faster_whisper — він пише "Processing audio..."
+# з паралельного потоку, що іноді тригерило race з RotatingFileHandler.
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 
 # Відомі галюцинації Whisper для української мови
 HALLUCINATION_PATTERNS = [
@@ -107,6 +183,8 @@ class DictationApp:
 
         self._is_dictating = False
         self._lock = threading.Lock()
+        # Whisper не thread-safe — серіалізуємо доступ до моделі.
+        self._model_lock = threading.Lock()
 
         # Стан тексту
         self._confirmed_text = ""  # Вже вставлений текст
@@ -120,7 +198,7 @@ class DictationApp:
 
     def start(self) -> None:
         logger.info("=" * 50)
-        logger.info("Диктовка UA — запуск")
+        logger.info("Диктовка UA — запуск (build: scancode-paste-10)")
         logger.info("Хоткей: %s", self._hotkey)
         logger.info("Модель: %s", self._model_size)
         logger.info("=" * 50)
@@ -184,7 +262,8 @@ class DictationApp:
         """Автоматична зупинка при перевищенні ліміту запису."""
         with self._lock:
             if self._is_dictating:
-                logger.info("Автостоп: зупиняю диктовку")
+                logger.info("Автостоп: зупиняю диктовку (ліміт %.0fс)", MAX_RECORDING_SEC)
+                _play_sound(SOUND_AUTOSTOP)
                 self._stop_dictation()
 
     def _start_dictation(self) -> None:
@@ -213,6 +292,7 @@ class DictationApp:
             # Запустити потік транскрипції
             threading.Thread(target=self._transcribe_loop, daemon=True).start()
 
+            _play_sound(SOUND_START)
             logger.info("Диктовка розпочата")
 
         except Exception as e:
@@ -220,26 +300,48 @@ class DictationApp:
             self._ui.set_state(AppState.ERROR, str(e))
 
     def _transcribe_chunk(self, audio) -> str:
-        """Транскрибувати один шматок аудіо з фільтром галюцинацій."""
-        segments, _ = self._transcriber._model.transcribe(
-            audio,
-            language="uk",
-            beam_size=1,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=300),
-            condition_on_previous_text=False,
-            no_speech_threshold=0.5,
-            hallucination_silence_threshold=1.0,
-        )
-        parts = []
-        for segment in segments:
-            text = segment.text.strip()
-            if not text or segment.no_speech_prob >= 0.7:
-                continue
-            if _is_hallucination(text):
-                logger.debug("Відфільтровано галюцинацію: '%s'", text)
-                continue
-            parts.append(text)
+        """
+        Транскрибувати один шматок аудіо з фільтром галюцинацій.
+        Серіалізовано через self._model_lock — Whisper не thread-safe.
+        """
+        model = self._transcriber._model
+        if model is None:
+            logger.warning("Whisper-модель не завантажена, пропускаю chunk")
+            return ""
+
+        duration_sec = len(audio) / 16000
+        thread_name = threading.current_thread().name
+        logger.info("Whisper START (%.2fs, thread=%s)", duration_sec, thread_name)
+
+        with self._model_lock:
+            try:
+                # vad_filter вимкнено: onnxruntime VAD DLL крашить процес з
+                # STATUS_BREAKPOINT (0x80000003) при першому використанні.
+                # Покладаємось на внутрішній no_speech_threshold + hallucination filter.
+                segments, _ = model.transcribe(
+                    audio,
+                    language="uk",
+                    beam_size=1,
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.5,
+                    hallucination_silence_threshold=1.0,
+                )
+                parts = []
+                seg_count = 0
+                for segment in segments:
+                    seg_count += 1
+                    text = segment.text.strip()
+                    if not text or segment.no_speech_prob >= 0.7:
+                        continue
+                    if _is_hallucination(text):
+                        logger.debug("Відфільтровано галюцинацію: '%s'", text)
+                        continue
+                    parts.append(text)
+            except Exception:
+                logger.exception("Whisper FAIL (thread=%s)", thread_name)
+                raise
+
+        logger.info("Whisper DONE (%d segments, thread=%s)", seg_count, thread_name)
         return " ".join(parts).strip()
 
     def _append_chunk_text(self, chunk_text: str, duration: float) -> None:
@@ -357,8 +459,13 @@ class DictationApp:
         try:
             self._is_dictating = False
             self._transcribe_stop.set()
+            _play_sound(SOUND_STOP)
 
-            self._full_audio = self._recorder.stop()
+            # Чекаємо завершення поточного Whisper-виклику ПЕРЕД recorder.stop().
+            # Інакше recorder.stop() (numpy.concatenate + logger.info) і
+            # паралельний model.transcribe() трігерять GC race → STATUS_BREAKPOINT.
+            with self._model_lock:
+                self._full_audio = self._recorder.stop()
             duration = len(self._full_audio) / 16000 if len(self._full_audio) > 0 else 0
 
             self._ui.set_state(AppState.TRANSCRIBING)

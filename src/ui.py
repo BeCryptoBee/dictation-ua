@@ -13,6 +13,8 @@ from typing import Callable, Optional
 import pystray
 from PIL import Image, ImageDraw
 
+from hotkey import SCAN_CODE_TO_KEY
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,14 +121,12 @@ class TrayUI:
 
         root = tk.Tk()
         root.title("Dictation UA")
-        root.geometry("340x150")
+        root.geometry("480x180")
         root.resizable(False, False)
         root.attributes("-topmost", True)
         root.configure(bg="#1e1e2e")
 
-        MODIFIERS = {"ctrl", "alt", "shift", "right ctrl", "right alt",
-                      "right shift", "left ctrl", "left alt", "left shift",
-                      "left windows", "right windows"}
+        MOD_NAMES = {"ctrl", "alt", "shift", "windows"}
 
         state = {"pressed": set(), "best": "", "done": False}
 
@@ -147,24 +147,43 @@ class TrayUI:
         )
         hint_label.pack()
 
-        def _normalize(name):
-            """Прибрати left/right префікси для фінального хоткея."""
+        def _normalize_mod(name):
+            """Якщо name це модифікатор — повернути канонічну назву, інакше None."""
+            n = name.lower().strip()
             for prefix in ("left ", "right "):
-                if name.startswith(prefix):
-                    return name[len(prefix):]
-            return name
+                if n.startswith(prefix):
+                    n = n[len(prefix):]
+            if n == "win":
+                n = "windows"
+            return n if n in MOD_NAMES else None
+
+        def _key_id_from_event(event):
+            """Перетворити keyboard event у стабільний ID клавіші (незалежно від розкладки)."""
+            raw = event.name.lower() if event.name else ""
+            if not raw:
+                return None
+            mod = _normalize_mod(raw)
+            if mod is not None:
+                return mod
+            # Звичайна клавіша — пробуємо scan_code → стандартне ім'я.
+            std = SCAN_CODE_TO_KEY.get(event.scan_code)
+            if std is not None:
+                return std
+            # Fallback для F-keys та інших клавіш, які keyboard віддає одним токеном.
+            if raw.isascii() and len(raw) <= 12:
+                return raw
+            return None
 
         def _format_combo(keys):
             """Сформувати рядок хоткея зі стабільним порядком."""
             mods = []
             regular = []
             for k in keys:
-                n = _normalize(k)
-                if n in ("ctrl", "alt", "shift", "windows"):
-                    if n not in mods:
-                        mods.append(n)
+                if k in MOD_NAMES:
+                    if k not in mods:
+                        mods.append(k)
                 else:
-                    regular.append(n)
+                    regular.append(k)
             order = ["ctrl", "alt", "shift", "windows"]
             sorted_mods = [m for m in order if m in mods]
             return "+".join(sorted_mods + regular)
@@ -191,19 +210,16 @@ class TrayUI:
         def _on_key(event):
             if state["done"]:
                 return
-            name = event.name.lower() if event.name else ""
-            if not name:
+            key_id = _key_id_from_event(event)
+            if key_id is None:
                 return
 
             if event.event_type == "down":
-                state["pressed"].add(name)
+                state["pressed"].add(key_id)
 
-                # Показати поточні натиснуті клавіші
                 combo = _format_combo(state["pressed"])
-                has_mod = any(_normalize(k) in ("ctrl", "alt", "shift", "windows")
-                             for k in state["pressed"])
-                has_key = any(_normalize(k) not in ("ctrl", "alt", "shift", "windows")
-                             for k in state["pressed"])
+                has_mod = any(k in MOD_NAMES for k in state["pressed"])
+                has_key = any(k not in MOD_NAMES for k in state["pressed"])
 
                 if has_mod and has_key:
                     # Повна комбінація — зберегти
@@ -219,7 +235,7 @@ class TrayUI:
                         text=(c + "+...").upper(), fg="#f9e2af"))
 
             elif event.event_type == "up":
-                state["pressed"].discard(name)
+                state["pressed"].discard(key_id)
 
         state["hook"] = kb.hook(_on_key)
 
@@ -247,8 +263,9 @@ class TrayUI:
         if self._icon is not None:
             self._icon.icon = _icon_for_state(state)
             self._icon.title = f"Диктовка UA — {tooltip}"
-            # Оновити меню щоб відобразити новий стан
-            self._icon.menu = self._build_menu()
+            # НЕ переоприсвоюємо self._icon.menu — items у меню це lambda's, які самі
+            # читають актуальний self._state при відкритті. Перебудова menu з робочого
+            # потоку трігерить race у pystray (_create_menu → GC) → STATUS_BREAKPOINT.
 
         logger.debug("UI стан: %s", tooltip)
 
